@@ -5,8 +5,8 @@
  * Based on arexibo layout.rs
  */
 
-import { cacheWidgetHtml } from '@xiboplayer/cache';
-import { createLogger, isDebug, PLAYER_API } from '@xiboplayer/utils';
+import { cacheWidgetHtml, resolveMediaSrc } from '@xiboplayer/cache';
+import { createLogger, isDebug, PLAYER_API, PLAYER_API_PATH, playerApiUrl, localApiUrl } from '@xiboplayer/utils';
 
 const log = createLogger('Layout');
 
@@ -171,7 +171,7 @@ export class LayoutTranslator {
 
         // Try to get cached widget HTML from ContentStore via proxy
         try {
-          const resp = await fetch(`/store${PLAYER_API}/widgets/${layoutId}/${regionId}/${id}`);
+          const resp = await fetch(localApiUrl(`/store${PLAYER_API_PATH}/widgets/${layoutId}/${regionId}/${id}`));
           if (resp.ok) {
             raw = await resp.text();
             options.widgetCacheKey = `${PLAYER_API}/widgets/${layoutId}/${regionId}/${id}`;
@@ -486,7 +486,7 @@ ${mediaJS}
     switch (media.type) {
       case 'image': {
         // Use absolute URL within service worker scope
-        const imageSrc = `${window.location.origin}${PLAYER_API}/media/${media.options.uri}`;
+        const imageSrc = resolveMediaSrc('media', media.options.uri, playerApiUrl(`/media/${media.options.uri}`));
         startFn = `() => {
         const region = document.getElementById('region_${regionId}');
         const img = document.createElement('img');
@@ -511,7 +511,7 @@ ${mediaJS}
       case 'video': {
         // All videos use cache URL pattern
         // Background-downloaded videos will auto-reload when cache completes
-        const videoSrc = `${window.location.origin}${PLAYER_API}/media/${media.options.uri}`;
+        const videoSrc = resolveMediaSrc('media', media.options.uri, playerApiUrl(`/media/${media.options.uri}`));
         const videoFilename = media.options.uri;
 
         startFn = `() => {
@@ -595,7 +595,7 @@ ${mediaJS}
         // Fall through to default (handles missing widgetCacheKey as unsupported)
 
       case 'audio': {
-        const audioSrc = `${window.location.origin}${PLAYER_API}/media/${media.options.uri}`;
+        const audioSrc = resolveMediaSrc('media', media.options.uri, playerApiUrl(`/media/${media.options.uri}`));
         const audioId = `audio_${regionId}_${media.id}`;
         const audioLoop = media.options.loop === '1';
         const audioVolume = (parseInt(media.options.volume || '100') / 100).toFixed(2);
@@ -712,7 +712,7 @@ ${mediaJS}
       }
 
       case 'pdf': {
-        const pdfSrc = `${window.location.origin}${PLAYER_API}/media/${media.options.uri}`;
+        const pdfSrc = resolveMediaSrc('media', media.options.uri, playerApiUrl(`/media/${media.options.uri}`));
         const pdfContainerId = `pdf_${regionId}_${media.id}`;
         const pdfDuration = duration; // Total duration for entire PDF
 

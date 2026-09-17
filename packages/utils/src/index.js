@@ -28,8 +28,60 @@ let _playerApi = _config.data?.playerApiBase || DEFAULT_PLAYER_API;
 /** Current Player API base path (no trailing slash). */
 export let PLAYER_API = _playerApi;
 
+function stripOrigin(base) {
+  return /^https?:\/\//i.test(base) ? new URL(base).pathname.replace(/\/+$/, '') : base;
+}
+
+/**
+ * PLAYER_API's path only, with any scheme+host stripped (Tizen/SSSP sets
+ * PLAYER_API to a full `http://127.0.0.1:PORT/...` origin — code that nests
+ * PLAYER_API as a path segment under another route, e.g. `/store${PLAYER_API}`
+ * or `STORE_PREFIX = PLAYER_API.slice(1)`, needs the bare path form or it
+ * produces a mangled URL).
+ */
+export let PLAYER_API_PATH = stripOrigin(_playerApi);
+
 /** Override the Player API base path at runtime (call before route registration). */
 export function setPlayerApi(base) {
   _playerApi = base.replace(/\/+$/, '');
   PLAYER_API = _playerApi;
+  PLAYER_API_PATH = stripOrigin(_playerApi);
+}
+
+/**
+ * Origin of the local proxy/companion server. Same derivation PLAYER_API
+ * uses: when PLAYER_API has been set to a full URL (Tizen/SSSP — see
+ * localApiUrl below), reuse ITS origin; otherwise fall back to the page's
+ * own origin (Electron/browser/Chromium-kiosk, where the proxy serves the
+ * page itself, so they share an origin).
+ */
+function localOrigin() {
+  if (/^https?:\/\//i.test(PLAYER_API)) {
+    return new URL(PLAYER_API).origin;
+  }
+  return window.location.origin;
+}
+
+/**
+ * Build a full Player API URL, handling both relative and absolute PLAYER_API
+ * bases. Packaged Tizen apps load from a `file://` document — for those,
+ * PLAYER_API is set to a full `http://127.0.0.1:PORT/player/api/v2` origin
+ * (see the SSSP Node-service bridge), so naively prefixing
+ * `window.location.origin` would produce a broken `file://http://...` URL.
+ * @param {string} pathSuffix - appended as-is (include the leading slash)
+ */
+export function playerApiUrl(pathSuffix) {
+  const base = /^https?:\/\//i.test(PLAYER_API) ? PLAYER_API : `${window.location.origin}${PLAYER_API}`;
+  return `${base}${pathSuffix}`;
+}
+
+/**
+ * Build a full URL for a local-proxy route that lives OUTSIDE the
+ * PLAYER_API prefix (e.g. StoreClient's `/store/*`, which is a sibling of
+ * `/player/api/v2` on the same proxy, not nested under it). Same file://
+ * concern as playerApiUrl — see localOrigin() above.
+ * @param {string} pathSuffix - appended as-is (include the leading slash)
+ */
+export function localApiUrl(pathSuffix) {
+  return `${localOrigin()}${pathSuffix}`;
 }

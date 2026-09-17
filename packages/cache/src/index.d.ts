@@ -136,6 +136,17 @@ export class StoreClient {
   list(): Promise<Array<{ id: string; type: string; size: number }>>;
 }
 
+export class TizenFileStoreClient {
+  has(type: string, id: string | number): Promise<boolean>;
+  get(type: string, id: string | number): Promise<Blob | null>;
+  put(type: string, id: string | number, body: Blob | ArrayBuffer | string, contentType?: string): Promise<boolean>;
+  remove(files: Array<{ type: string; id: string | number }>): Promise<{ deleted: number; total: number }>;
+  list(): Promise<Array<{ id: string; type: string; size: number }>>;
+}
+export function getTizenCachedUri(type: string, id: string | number): string | null;
+export function isTizenFilesystemAvailable(): boolean;
+export function resolveMediaSrc(type: string, id: string | number, fallback: string): string;
+
 export class DownloadManager {
   constructor(options?: { concurrency?: number; chunkSize?: number; chunksPerFile?: number; getAuthHeaders?: () => Promise<Record<string, string> | null> });
   enqueue(fileInfo: any): any;

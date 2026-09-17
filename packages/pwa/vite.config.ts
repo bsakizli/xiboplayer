@@ -35,6 +35,41 @@ const app = defineConfig({
   },
 });
 
+// Tizen build — this Samsung TV's WebKit (Tizen 5.5, ~2019) fails to fetch
+// ANY module-relative resource for packaged file:// content, both dynamic
+// import() and static <script type="module" src="..."> — confirmed via an
+// isolated on-device test (STEP5). ES modules are unusable here entirely,
+// so the whole app is compiled to a single classic (non-module) IIFE script.
+// codeSplitting:false requires a single input per build, hence two passes.
+function tizenEntry(name, emptyOutDir) {
+  return defineConfig({
+    define: common,
+    base: './',
+    build: {
+      outDir: 'dist',
+      sourcemap: true,
+      emptyOutDir,
+      // Also down-level syntax: this engine's parser rejects ES2020 features
+      // (confirmed via on-device "Unexpected token ?" — optional chaining
+      // and/or nullish coalescing) even once module loading itself works.
+      target: 'es2015',
+      rollupOptions: {
+        external: ['hls.js'],
+        input: { [name]: path.resolve(__dirname, `${name}.html`) },
+        output: {
+          codeSplitting: false,
+          format: 'iife',
+          name: 'XiboTizenApp',
+          globals: { 'hls.js': 'Hls' },
+        },
+      },
+    },
+  });
+}
+
+const tizenMain = tizenEntry('index', true);
+const tizenSetup = tizenEntry('setup', false);
+
 // Service Worker build — isolated so no DOM globals leak into SW context
 const sw = defineConfig({
   define: common,
@@ -56,4 +91,10 @@ const sw = defineConfig({
   },
 });
 
-export default process.env.BUILD_SW ? sw : app;
+export default process.env.BUILD_SW
+  ? sw
+  : process.env.BUILD_TIZEN_MAIN
+    ? tizenMain
+    : process.env.BUILD_TIZEN_SETUP
+      ? tizenSetup
+      : app;

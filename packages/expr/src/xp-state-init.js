@@ -132,18 +132,22 @@ function _parseGzipB64(b64) {
  *     need today.
  */
 let NODE_GUNZIP = null;
-try {
-  const proc = typeof globalThis !== 'undefined' ? globalThis.process : null;
-  if (proc && proc.versions && proc.versions.node) {
-    // Top-level await at module load. Safe in Node ≥ 14.8 and every
-    // bundler that targets ESM (which is all of them in 2026).
-    // eslint-disable-next-line no-restricted-syntax
-    const zlib = await import('node:zlib');
-    NODE_GUNZIP = zlib.gunzipSync;
+// Fire-and-forget async IIFE instead of a top-level await: some bundler
+// output formats (e.g. Rollup's 'iife', used for webviews that can't load
+// ES modules at all) reject top-level await outright. This still resolves
+// well before _gunzipSync's first real call in practice (module init is
+// always followed by async CMS/network work before any layout is parsed).
+(async () => {
+  try {
+    const proc = typeof globalThis !== 'undefined' ? globalThis.process : null;
+    if (proc && proc.versions && proc.versions.node) {
+      const zlib = await import('node:zlib');
+      NODE_GUNZIP = zlib.gunzipSync;
+    }
+  } catch (_err) {
+    // Import failed — non-Node environment, leave NODE_GUNZIP null.
   }
-} catch (_err) {
-  // Import failed — non-Node environment, leave NODE_GUNZIP null.
-}
+})();
 
 function _gunzipSync(bytes) {
   if (NODE_GUNZIP) {

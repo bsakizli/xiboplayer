@@ -42,7 +42,8 @@
  */
 
 import { EventEmitter } from '@xiboplayer/utils';
-import { createLogger, isDebug, PLAYER_API } from '@xiboplayer/utils';
+import { createLogger, isDebug, PLAYER_API, playerApiUrl } from '@xiboplayer/utils';
+import { resolveMediaSrc } from '@xiboplayer/cache';
 import { parseLayoutDuration } from '@xiboplayer/schedule';
 import { asBool, ExprOutOfScope, evalExpr, XpStateStore, parseXpStateInit } from '@xiboplayer/expr';
 import { LayoutPool } from './layout-pool.js';
@@ -1608,7 +1609,7 @@ export class RendererLite {
    * @returns {string} Full URL for the media file
    */
   _mediaFileUrl(storedAs) {
-    return `${window.location.origin}${PLAYER_API}/media/file/${storedAs}`;
+    return resolveMediaSrc('media', storedAs, playerApiUrl(`/media/file/${storedAs}`));
   }
 
   /**
@@ -1911,6 +1912,7 @@ export class RendererLite {
    * @returns {Promise<HTMLElement>} Widget DOM element
    */
   async createWidgetElement(widget, region) {
+    try { window.__dbg && window.__dbg('[createWidgetElement] widget=' + widget.id + ' type=' + widget.type + ' render=' + widget.render); } catch (_e) {}
     // render="html" forces GetResource iframe regardless of native type,
     // EXCEPT for types we handle natively (PDF: CMS bundle can't work cross-origin)
     if (widget.render === 'html' && widget.type !== 'pdf') {
@@ -3270,6 +3272,32 @@ export class RendererLite {
       const result = await this.options.getWidgetHtml(widget);
       if (result && typeof result === 'object' && result.url) {
         // Use cache URL — SW serves HTML and intercepts sub-resources
+        try { window.__dbg && window.__dbg('[iframe] setting src=' + result.url); } catch (_e) {}
+        iframe.addEventListener('load', () => {
+          try {
+            window.__dbg && window.__dbg('[iframe] LOAD OK for widget ' + widget.id);
+            const win = iframe.contentWindow;
+            const doc = iframe.contentDocument;
+            if (win) {
+              win.onerror = function (msg, src, line, col) {
+                try { window.__dbg && window.__dbg('[iframe-JS-ERROR] ' + msg + ' @' + line + ':' + col); } catch (_e2) {}
+              };
+            }
+            if (doc && doc.body) {
+              const snippet = doc.body.innerHTML.replace(/\s+/g, ' ').substring(0, 400);
+              window.__dbg && window.__dbg('[iframe] body: ' + snippet);
+              const img = doc.querySelector('img');
+              if (img) window.__dbg && window.__dbg('[iframe] img.src=' + img.src + ' naturalWidth=' + img.naturalWidth);
+            } else {
+              window.__dbg && window.__dbg('[iframe] no contentDocument/body (cross-origin?)');
+            }
+          } catch (e) {
+            try { window.__dbg && window.__dbg('[iframe] inspect FAILED: ' + e.message); } catch (_e3) {}
+          }
+        });
+        iframe.addEventListener('error', (ev) => {
+          try { window.__dbg && window.__dbg('[iframe] ERROR for widget ' + widget.id + ': ' + (ev?.message || ev)); } catch (_e) {}
+        });
         iframe.src = result.url;
 
         // Parse NUMITEMS/DURATION from fallback HTML (cache path)

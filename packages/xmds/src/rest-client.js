@@ -537,6 +537,10 @@ export class RestClient {
    * @returns {Promise<boolean>} true if v2 is available
    */
   static async isAvailable(cmsUrl, retryOptions) {
+    // 'direct' sentinel (Tizen native-filesystem mode — no proxy, no REST
+    // layer at all, XMDS/SOAP only) — PLAYER_API isn't a real path here, so
+    // don't even attempt to build a probe URL from it.
+    if (PLAYER_API === 'direct') return false;
     try {
       // In proxy mode, probe the local proxy's forward route instead of the CMS directly (avoids CORS)
       const isProxy = typeof window !== 'undefined' &&

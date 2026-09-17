@@ -8,10 +8,10 @@
  */
 
 import { RendererLite } from '@xiboplayer/renderer';
-import { StoreClient, DownloadManager, BARRIER } from '@xiboplayer/cache';
+import { StoreClient, TizenFileStoreClient, isTizenFilesystemAvailable, resolveMediaSrc, DownloadManager, BARRIER } from '@xiboplayer/cache';
 import { PlayerCore, CORE_EVENTS as E } from '@xiboplayer/core';
 import { parseLayoutDuration, parseLayoutFile } from '@xiboplayer/schedule';
-import { createLogger, registerLogSink, PLAYER_API } from '@xiboplayer/utils';
+import { createLogger, registerLogSink, PLAYER_API, PLAYER_API_PATH, playerApiUrl, localApiUrl } from '@xiboplayer/utils';
 import { DatasourceClient, attachHostBridge } from '@xiboplayer/datasource';
 import { DownloadOverlay, getDefaultOverlayConfig } from './download-overlay.js';
 import { TimelineOverlay, isTimelineVisible } from './timeline-overlay.js';
@@ -22,11 +22,38 @@ declare const __BUILD_DATE__: string;
 
 const log = createLogger('PWA');
 
-// ContentStore key prefix — mirrors PLAYER_API without leading slash
-const STORE_PREFIX = PLAYER_API.slice(1);
+// ContentStore key prefix — mirrors PLAYER_API's path without leading slash
+// (PLAYER_API_PATH, not PLAYER_API — the latter may be a full origin on Tizen/SSSP)
+const STORE_PREFIX = PLAYER_API_PATH.slice(1);
 
 // Dynamic base path — same build serves /player/pwa/, /player/pwa-xmds/, /player/pwa-xlr/
 const PLAYER_BASE = new URL('./', window.location.href).pathname.replace(/\/$/, '');
+
+/**
+ * Blob.prototype.text() doesn't exist on this old Tizen webview (Chromium
+ * ~69 — the method landed around Chrome 76, same era as arrayBuffer()).
+ * FileReader.readAsText has been universally supported forever.
+ */
+function blobText(blob: Blob): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(reader.result as string);
+    reader.onerror = () => reject(reader.error || new Error('FileReader failed'));
+    reader.readAsText(blob);
+  });
+}
+
+/**
+ * Check whether a media file (by storedAs filename) is already cached,
+ * using each store backend's own natural key shape — TizenFileStoreClient
+ * uses plain ('media', saveAs); the proxy-backed StoreClient mirrors the
+ * REST path (STORE_PREFIX, 'media/file/saveAs').
+ */
+function hasMediaCached(saveAs: string): Promise<boolean> {
+  return isTizenFilesystemAvailable()
+    ? store.has('media', saveAs)
+    : store.has(STORE_PREFIX, `media/file/${saveAs}`);
+}
 
 // Import core modules (will be loaded at runtime)
 let cacheWidgetHtml: any;
@@ -36,7 +63,7 @@ let RestClient: any;
 let XmdsClient: any;
 let ProtocolDetector: any;
 let XmrWrapper: any;
-let store: StoreClient;
+let store: StoreClient | TizenFileStoreClient;
 let downloadManager: DownloadManager;
 let StatsCollector: any;
 let formatStats: any;
@@ -115,9 +142,10 @@ class PwaPlayer {
       }
     }
 
-    // Initialize StoreClient (REST) + DownloadManager (main thread)
+    // Initialize StoreClient (REST, or Tizen native filesystem when there's
+    // no local proxy/SSSP node service to back /store/* at all) + DownloadManager
     log.info('Initializing cache clients...');
-    store = new StoreClient();
+    store = isTizenFilesystemAvailable() ? new TizenFileStoreClient() : new StoreClient();
     const { calculateChunkConfig } = await import('@xiboplayer/sw');
     this._chunkConfig = calculateChunkConfig(log);
     downloadManager = new DownloadManager({
@@ -156,12 +184,31 @@ class PwaPlayer {
         fileIdToSaveAs: this._fileIdToSaveAs,
 
         // Provide widget HTML resolver — check ContentStore via proxy
+        // (or Tizen native filesystem, when there's no proxy at all)
         getWidgetHtml: async (widget: any) => {
+          const widgetKey = `${widget.layoutId}/${widget.regionId}/${widget.id}`;
+
+          if (isTizenFilesystemAvailable()) {
+            try {
+              const exists = await store.has('widget', widgetKey);
+              if (exists) {
+                const uri = resolveMediaSrc('widget', widgetKey, '');
+                if (uri) return { url: uri, fallback: widget.raw || '' };
+              } else {
+                log.warn(`No widget HTML found in Tizen filesystem store: ${widgetKey}`);
+              }
+            } catch (error) {
+              log.error(`Failed to check widget HTML for ${widget.id}:`, error);
+            }
+            log.warn(`Using widget.raw fallback for ${widget.id}`);
+            return widget.raw || '';
+          }
+
           const widgetPath = `${PLAYER_API}/widgets/${widget.layoutId}/${widget.regionId}/${widget.id}`;
           log.debug(`Looking for widget HTML at: ${widgetPath}`, widget);
 
           try {
-            const exists = await store.has(`${STORE_PREFIX}/widgets`, `${widget.layoutId}/${widget.regionId}/${widget.id}`);
+            const exists = await store.has(`${STORE_PREFIX}/widgets`, widgetKey);
             if (exists) {
               log.debug(`Widget HTML found in store, using mirror URL for iframe`);
               return { url: widgetPath, fallback: widget.raw || '' };
@@ -748,6 +795,10 @@ class PwaPlayer {
     if (this.displaySettings) {
       this.displaySettings.on('interval-changed', (newInterval: number) => {
         log.info(`Collection interval changed to ${newInterval}s`);
+      });
+
+      this.displaySettings.on('timers-changed', (timers: Record<string, { on: string; off: string }>) => {
+        this.applyPowerTimers(timers);
       });
 
       this.displaySettings.on('settings-applied', (_settings: any, changes: string[]) => {
@@ -1576,8 +1627,21 @@ class PwaPlayer {
     const { layoutOrder, files, layoutDependants } = data;
     // Use DownloadManager facade methods (not direct queue access)
 
-    /** Store key = URL path without leading / and query params */
-    const storeKeyFrom = (f: any) => (f.path || '').split('?')[0].replace(/^\/+/, '') || `${f.type || 'media'}/${f.id}`;
+    /**
+     * Store key = URL path without leading / and query params. f.path may be
+     * a full absolute URL (Tizen/SSSP — PLAYER_API is a full localhost
+     * origin there) or a plain relative path (Electron/browser) — resolve
+     * via URL() against the page's own location so both cases yield just
+     * the path component, not an origin-prefixed key.
+     */
+    const storeKeyFrom = (f: any) => {
+      if (!f.path) return `${f.type || 'media'}/${f.id}`;
+      try {
+        return new URL(f.path, window.location.href).pathname.replace(/^\/+/, '') || `${f.type || 'media'}/${f.id}`;
+      } catch (_) {
+        return (f.path || '').split('?')[0].replace(/^\/+/, '') || `${f.type || 'media'}/${f.id}`;
+      }
+    };
 
     // Build fileId→saveAs map from CMS RequiredFiles data
     for (const f of files) {
@@ -1605,6 +1669,9 @@ class PwaPlayer {
     }
 
     log.info(`Download: ${layoutOrder.length} layouts, ${mediaFiles.size} media, ${resources.length} resources`);
+    if (isTizenFilesystemAvailable()) {
+      try { (window as any).__dbg && (window as any).__dbg(`[main] Download: ${layoutOrder.length} layouts, ${mediaFiles.size} media, ${resources.length} resources, files.length=${files.length}`); } catch (_e) {}
+    }
 
     // ── Step 1: Fetch + parse all XLFs (cache-through handles store/CMS) ──
     const layoutMediaMap = new Map();
@@ -1636,49 +1703,74 @@ class PwaPlayer {
     await Promise.allSettled(xlfPromises);
     log.info(`Parsed ${layoutMediaMap.size} XLFs`);
 
+    // Temporary direct-to-screen instrumentation (bypasses CMS-narrowed log
+    // level) — TODO remove once Method 2 is verified end-to-end.
+    const fsDbg = (msg: string) => { try { (window as any).__dbg && (window as any).__dbg('[main] ' + msg); } catch (_e) {} };
+
     // Helper: enqueue a file, attach completion callback
     const enqueueFile = async (builder: any, file: any): Promise<boolean> => {
       if (!file.path || file.path === 'null' || file.path === 'undefined') return false;
 
       const storeKey = storeKeyFrom(file);
 
-      // Check if already stored on disk (200 = cached, 204 = not in store)
-      try {
-        const headResp = await fetch(`/store/${storeKey}`, { method: 'HEAD' });
-        if (headResp.status === 200) return false;
-      } catch (_) {}
+      if (isTizenFilesystemAvailable()) {
+        fsDbg('enqueueFile: ' + (file.type || 'media') + '/' + (file.saveAs || file.id) + ' path=' + file.path);
+        // No proxy/chunked-resume bookkeeping in this mode — one full file
+        // per store.put(). Just check whether it's already on disk.
+        const cached = await store.has(file.type || 'media', file.saveAs || file.id);
+        if (cached) { fsDbg('already cached, skipping'); return false; }
+      } else {
+        // Check if already stored on disk (200 = cached, 204 = not in store)
+        try {
+          const headResp = await fetch(localApiUrl(`/store/${storeKey}`), { method: 'HEAD' });
+          if (headResp.status === 200) return false;
+        } catch (_) {}
+      }
 
       // Check if already downloading (download manager keys are type/id, not URL paths)
       const dmKey = `${file.type}/${file.id}`;
       if (downloadManager.getTask(dmKey)) return false;
 
-      // Check for existing chunks — skip already-downloaded ones
-      try {
-        const mcResp = await fetch(`/store/missing-chunks/${storeKey}`);
-        if (mcResp.ok) {
-          const { missing, numChunks } = await mcResp.json();
-          if (numChunks > 0 && missing.length < numChunks) {
-            const existing = new Set<number>();
-            for (let i = 0; i < numChunks; i++) {
-              if (!missing.includes(i)) existing.add(i);
+      // Check for existing chunks — skip already-downloaded ones (proxy mode only)
+      if (!isTizenFilesystemAvailable()) {
+        try {
+          const mcResp = await fetch(localApiUrl(`/store/missing-chunks/${storeKey}`));
+          if (mcResp.ok) {
+            const { missing, numChunks } = await mcResp.json();
+            if (numChunks > 0 && missing.length < numChunks) {
+              const existing = new Set<number>();
+              for (let i = 0; i < numChunks; i++) {
+                if (!missing.includes(i)) existing.add(i);
+              }
+              file.skipChunks = existing;
+              log.info(`Resuming ${storeKey}: ${existing.size}/${numChunks} chunks cached, ${missing.length} to download`);
             }
-            file.skipChunks = existing;
-            log.info(`Resuming ${storeKey}: ${existing.size}/${numChunks} chunks cached, ${missing.length} to download`);
           }
-        }
-      } catch (_) {}
+        } catch (_) {}
+      }
 
       const fileDownload = builder.addFile(file);
-      if (fileDownload.state !== 'pending') return false;
+      if (fileDownload.state !== 'pending') { if (isTizenFilesystemAvailable()) fsDbg('addFile state=' + fileDownload.state + ', not pending'); return false; }
+      if (isTizenFilesystemAvailable()) fsDbg('download started for ' + storeKey);
 
       // Direct callback — no postMessage needed
-      fileDownload.wait().then((blob: any) => {
+      fileDownload.wait().then(async (blob: any) => {
         const fileSize = parseInt(file.size) || blob.size;
         log.info('Download complete:', storeKey, `(${fileSize} bytes)`);
+        if (isTizenFilesystemAvailable()) fsDbg('download complete for ' + storeKey + ', ' + fileSize + ' bytes, writing...');
 
-        // Mark chunked files as complete
-        if (fileSize > this._chunkConfig.chunkSize) {
-          fetch('/store/mark-complete', {
+        // Tizen native-filesystem mode: no proxy cache-through server exists
+        // to persist the download as a side effect of fetching it, so we
+        // must write it ourselves.
+        if (isTizenFilesystemAvailable()) {
+          const ok = await store.put(file.type || 'media', file.saveAs || file.id, blob);
+          if (!ok) log.warn('Tizen filesystem write failed:', storeKey);
+        }
+
+        // Mark chunked files as complete (proxy-only — Tizen filesystem mode
+        // writes the whole blob in one put() above, no chunk bookkeeping to mark)
+        if (fileSize > this._chunkConfig.chunkSize && !isTizenFilesystemAvailable()) {
+          fetch(localApiUrl('/store/mark-complete'), {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ storeKey }),
@@ -1689,6 +1781,7 @@ class PwaPlayer {
         downloadManager.removeCompleted(dmKey);
       }).catch((err: any) => {
         log.error('Download failed:', file.id, err);
+        if (isTizenFilesystemAvailable()) fsDbg('DOWNLOAD FAILED for ' + storeKey + ': ' + (err && err.message ? err.message : err));
         downloadManager.removeCompleted(dmKey);
       });
       return true;
@@ -2014,7 +2107,7 @@ class PwaPlayer {
           return;
         }
 
-        const xlfXml = await xlfBlob.text();
+        const xlfXml = await blobText(xlfBlob);
         const doc = new DOMParser().parseFromString(xlfXml, 'text/xml');
 
         // Check if all required media is cached
@@ -2045,13 +2138,13 @@ class PwaPlayer {
     // Handle video playback errors — re-download only missing chunks
     this.renderer.on('videoError', async ({ storedAs }: any) => {
       if (!storedAs) return;
-      const storeKey = `${PLAYER_API.slice(1)}/media/file/${storedAs}`;
+      const storeKey = `${PLAYER_API_PATH.slice(1)}/media/file/${storedAs}`;
       try {
-        const resp = await fetch(`/store/missing-chunks/${storeKey}`);
+        const resp = await fetch(localApiUrl(`/store/missing-chunks/${storeKey}`));
         const { missing } = await resp.json();
         if (missing.length === 0) {
           log.warn(`Video ${storedAs}: corrupt file (all chunks present), deleting for re-download`);
-          await fetch('/store/delete', {
+          await fetch(localApiUrl('/store/delete'), {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ files: [{ key: storeKey }] }),
@@ -2068,7 +2161,7 @@ class PwaPlayer {
         log.warn(`Video ${storedAs}: ${missing.length} missing chunks (${missing.join(', ')}), re-downloading`);
 
         // Unmark completion (keeps existing chunks on disk) so HEAD returns 404
-        await fetch('/store/unmark-complete', {
+        await fetch(localApiUrl('/store/unmark-complete'), {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ storeKey }),
@@ -2121,7 +2214,7 @@ class PwaPlayer {
         return;
       }
 
-      const xlfXml = await xlfBlob.text();
+      const xlfXml = await blobText(xlfBlob);
 
       // Parse XLF once — reuse Document for media check and widget HTML fetch
       const xlfDoc = new DOMParser().parseFromString(xlfXml, 'text/xml');
@@ -2239,7 +2332,7 @@ class PwaPlayer {
     const results = await Promise.all(
       toCheck.map(async (saveAs) => {
         try {
-          const cached = await store.has(STORE_PREFIX, `media/file/${saveAs}`);
+          const cached = await hasMediaCached(saveAs);
           if (cached) this._cachedMediaKeys.add(saveAs);
           return cached;
         } catch {
@@ -2284,9 +2377,11 @@ class PwaPlayer {
                 const storeId = `${layoutId}/${regionId}/${widgetId}`;
                 let html: string | null = null;
 
-                const existing = await store.get(`${STORE_PREFIX}/widgets`, storeId);
+                const existing = isTizenFilesystemAvailable()
+                  ? await store.get('widget', storeId)
+                  : await store.get(`${STORE_PREFIX}/widgets`, storeId);
                 if (existing) {
-                  html = await existing.text();
+                  html = await blobText(existing);
                   log.debug(`Found cached widget HTML for ${type} ${widgetId}`);
                 }
 
@@ -2338,7 +2433,7 @@ class PwaPlayer {
         const xlfBlob = await store.get(`${STORE_PREFIX}/layouts`, layoutId);
         if (!xlfBlob) continue;
 
-        const xlfXml = await xlfBlob.text();
+        const xlfXml = await blobText(xlfBlob);
         const { allMedia } = this.getMediaIds(xlfXml);
 
         if (allMedia.length === 0) {
@@ -2353,7 +2448,7 @@ class PwaPlayer {
           const storeKey = `${STORE_PREFIX}/media/file/${saveAs}`;
           if (downloadManager.getTask(storeKey)) { missing.push(saveAs); continue; }
           try {
-            const cached = await store.has(STORE_PREFIX, `media/file/${saveAs}`);
+            const cached = await hasMediaCached(saveAs);
             if (cached) this._cachedMediaKeys.add(saveAs);
             else missing.push(saveAs);
           } catch {
@@ -2385,7 +2480,7 @@ class PwaPlayer {
         const xlfBlob = await store.get(`${STORE_PREFIX}/layouts`, layoutId);
         if (!xlfBlob) continue;
 
-        const xlfXml = await xlfBlob.text();
+        const xlfXml = await blobText(xlfBlob);
         const { videoMedia } = this.getMediaIds(xlfXml);
         if (videoMedia.length === 0) continue;
 
@@ -2405,11 +2500,11 @@ class PwaPlayer {
           dynamicVideoCount++;
 
           const saveAs = this._fileIdToSaveAs.get(fileId) || fileId;
-          const exists = await store.has(STORE_PREFIX, `media/file/${saveAs}`);
+          const exists = await hasMediaCached(saveAs);
           if (!exists) continue;
 
           // Probe metadata only — does NOT download the full video
-          const duration = await this.probeVideoDuration(`${window.location.origin}${PLAYER_API}/media/file/${saveAs}`);
+          const duration = await this.probeVideoDuration(resolveMediaSrc('media', saveAs, playerApiUrl(`/media/file/${saveAs}`)));
           if (duration > 0) {
             videoDurations.set(fileId, duration);
           }
@@ -2986,6 +3081,52 @@ class PwaPlayer {
       y: rect.top + (rect.height - h) / 2,
       w, h,
     };
+  }
+
+  /**
+   * Apply the CMS-managed power on/off schedule (Display → On/Off Timers tab)
+   * to the TV's own hardware timers via Samsung SSSP's b2bcontrol API.
+   *
+   * `timers` is keyed by lowercase day name (e.g. "monday") with
+   * { on: "HH:MM", off: "HH:MM" } — matches xibo-cms's
+   * DisplayProfileConfigFields::processConfigFieldsTimer() storage format.
+   *
+   * UNVERIFIED on real hardware — b2bcontrol.setOnTimerRepeat's day-range
+   * argument format ("SUN:WED" seen in Samsung sample code) is assumed to
+   * also accept a single-day range ("MON:MON") for one specific weekday;
+   * this needs confirming on the actual QM55C. See PROGRESS.md.
+   */
+  private applyPowerTimers(timers: Record<string, { on: string; off: string }> | null) {
+    const b2b = (window as any).b2bapis?.b2bcontrol;
+    if (!b2b || !b2b.setOnTimerRepeat) {
+      log.debug('applyPowerTimers: b2bcontrol not available (not SSSP hardware?)');
+      return;
+    }
+    if (!timers) {
+      log.info('No CMS power timers configured');
+      return;
+    }
+
+    const DAY_CODE: Record<string, string> = {
+      sunday: 'SUN', monday: 'MON', tuesday: 'TUE', wednesday: 'WED',
+      thursday: 'THU', friday: 'FRI', saturday: 'SAT',
+    };
+
+    Object.entries(timers).forEach(([day, times], i) => {
+      const code = DAY_CODE[day.toLowerCase()];
+      if (!code || !times?.on || !times?.off) return;
+      const range = `${code}:${code}`;
+      const timerId = `XIBO_ON_${i}`;
+      const offTimerId = `XIBO_OFF_${i}`;
+
+      b2b.setOnTimerRepeat(timerId, times.on, 'TIMER_MANUAL', range,
+        () => log.info(`Power ON timer set: ${day} ${times.on}`),
+        (e: any) => log.warn(`Power ON timer FAILED (${day}):`, e?.message || e));
+
+      b2b.setOffTimerRepeat(offTimerId, times.off, 'TIMER_MANUAL', range,
+        () => log.info(`Power OFF timer set: ${day} ${times.off}`),
+        (e: any) => log.warn(`Power OFF timer FAILED (${day}):`, e?.message || e));
+    });
   }
 
   /**

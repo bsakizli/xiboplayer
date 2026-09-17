@@ -2,6 +2,10 @@
 // Copyright (c) 2024-2026 Pau Aliagas <linuxnow@gmail.com>
 export const VERSION: string;
 export let PLAYER_API: string;
+export let PLAYER_API_PATH: string;
+export function setPlayerApi(base: string): void;
+export function playerApiUrl(pathSuffix: string): string;
+export function localApiUrl(pathSuffix: string): string;
 
 export interface Logger {
   debug(...args: any[]): void;

@@ -9,6 +9,7 @@
   "scripts": {
     "dev": "vite",
     "build": "tsc && vite build && BUILD_SW=1 vite build",
+    "build:tizen": "tsc && BUILD_TIZEN_MAIN=1 vite build && BUILD_TIZEN_SETUP=1 vite build && BUILD_SW=1 vite build",
     "preview": "vite preview",
     "type-check": "tsc --noEmit",
     "test:e2e": "playwright test"

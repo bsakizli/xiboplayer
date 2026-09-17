@@ -453,6 +453,14 @@ export class Config {
       return;
     }
 
+    // Web Crypto's SubtleCrypto is only exposed in secure contexts (https/localhost).
+    // Some WebKit builds (older Tizen TVs served over plain http/file) never expose it —
+    // registration must still proceed without an XMR key pair (falls back to polling).
+    if (typeof crypto === 'undefined' || !crypto.subtle) {
+      log.warn('SubtleCrypto unavailable (insecure context) — skipping XMR key pair, XMR push disabled');
+      return;
+    }
+
     log.info('Generating RSA key pair for XMR registration...');
     const { publicKeyPem, privateKeyPem } = await generateRsaKeyPair();
 

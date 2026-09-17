@@ -87,6 +87,13 @@ export class DisplaySettings extends EventEmitter {
 
       // SSP (ad space)
       isSspEnabled: false,
+
+      // Power on/off schedule (CMS Display → On/Off Timers tab). `timers` is
+      // a JSON object keyed by day name: { monday: { on: "07:00", off: "18:00" }, ... }.
+      // disableTimerManagement: true means the CMS leaves the device's own
+      // on-screen timer settings alone (player should not touch them).
+      timers: null,
+      disableTimerManagement: false,
     };
   }
 
@@ -138,7 +145,27 @@ export class DisplaySettings extends EventEmitter {
     // SSP
     this.settings.isSspEnabled = this.parseBoolean(settings.isAdspaceEnabled || settings.IsAdspaceEnabled);
 
+    // Power on/off schedule
+    this.settings.disableTimerManagement = this.parseBoolean(
+      settings.disableTimerManagement || settings.DisableTimerManagement
+    );
+    const rawTimers = settings.timers || settings.Timers;
+    let parsedTimers = null;
+    if (rawTimers) {
+      try {
+        parsedTimers = typeof rawTimers === 'string' ? JSON.parse(rawTimers) : rawTimers;
+      } catch (e) {
+        log.warn('Failed to parse timers setting:', e.message);
+      }
+    }
+    const timersChanged = JSON.stringify(parsedTimers) !== JSON.stringify(this.settings.timers);
+    this.settings.timers = parsedTimers;
+
     // Detect changes
+    if (timersChanged && !this.settings.disableTimerManagement) {
+      changes.push('timers');
+      this.emit('timers-changed', this.settings.timers);
+    }
     if (oldInterval !== this.settings.collectInterval) {
       changes.push('collectInterval');
       this.emit('interval-changed', this.settings.collectInterval);

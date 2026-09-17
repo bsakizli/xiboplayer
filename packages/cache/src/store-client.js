@@ -15,7 +15,7 @@
  *   const files = await store.list();
  */
 
-import { createLogger } from '@xiboplayer/utils';
+import { createLogger, localApiUrl } from '@xiboplayer/utils';
 
 const log = createLogger('StoreClient');
 
@@ -28,7 +28,7 @@ export class StoreClient {
    */
   async has(type, id) {
     try {
-      const response = await fetch(`/store/${type}/${id}`, { method: 'HEAD' });
+      const response = await fetch(localApiUrl(`/store/${type}/${id}`), { method: 'HEAD' });
       if (response.status === 204) return false; // Not in store (no console error)
       if (response.status === 200) {
         // Incomplete chunked files return 200 with X-Store-Complete: false
@@ -61,7 +61,7 @@ export class StoreClient {
    */
   async get(type, id) {
     try {
-      const response = await fetch(`/store/${type}/${id}`);
+      const response = await fetch(localApiUrl(`/store/${type}/${id}`));
       if (response.status === 204 || response.status === 404) {
         response.body?.cancel();
         return null;
@@ -87,7 +87,7 @@ export class StoreClient {
    */
   async put(type, id, body, contentType = 'application/octet-stream') {
     try {
-      const response = await fetch(`/store/${type}/${id}`, {
+      const response = await fetch(localApiUrl(`/store/${type}/${id}`), {
         method: 'PUT',
         headers: { 'Content-Type': contentType },
         body,
@@ -107,7 +107,7 @@ export class StoreClient {
    */
   async remove(files) {
     try {
-      const response = await fetch('/store/delete', {
+      const response = await fetch(localApiUrl('/store/delete'), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ files }),
@@ -126,7 +126,7 @@ export class StoreClient {
    */
   async list() {
     try {
-      const response = await fetch('/store/list');
+      const response = await fetch(localApiUrl('/store/list'));
       const data = await response.json();
       return data.files || [];
     } catch (error) {

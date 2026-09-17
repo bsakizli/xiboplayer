@@ -274,7 +274,11 @@ export class XmdsClient {
 
       // Rewrite XMDS download URLs to local proxy cache-through paths.
       // Store the original CMS URL so the proxy can fetch on cache miss.
-      if (file.path && file.path.includes('xmds.php')) {
+      // Skipped entirely when PLAYER_API === 'direct' (no local server at
+      // all — e.g. Tizen native-filesystem mode; see @xiboplayer/cache's
+      // tizen-filesystem-store.js). In that mode file.path stays the
+      // original signed CMS URL so DownloadTask fetches it directly.
+      if (file.path && file.path.includes('xmds.php') && PLAYER_API !== 'direct') {
         file.cmsDownloadUrl = file.path;
         const xmdsType = file.fileType; // L=layout, M=media, P=resource
         if (xmdsType === 'L' || file.type === 'layout') {
@@ -284,6 +288,8 @@ export class XmdsClient {
         } else {
           file.path = `${PLAYER_API}/media/file/${file.saveAs || file.id}`;
         }
+      } else if (file.path && file.path.includes('xmds.php')) {
+        file.cmsDownloadUrl = file.path;
       }
 
       files.push(file);
